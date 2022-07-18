@@ -19,7 +19,13 @@ class Annotate():
     def __init__(self,filenames, exclude_labeled=True, run=True):
 
         if exclude_labeled:
-            filenames = [fn for fn in filenames if not os.path.exists(fn.replace("_input","_label"))]
+
+            if ".tif" in filenames[0].lower():
+                filenames = [fn for fn in filenames if not os.path.exists(fn.replace("_input","_label"))]
+            elif ".h5" in filenames[0].lower():
+                filenames = check_dataset(filenames,"labels")
+
+        print(len(filenames))
         
         if len(filenames)==0:
             print("no images")
@@ -35,6 +41,7 @@ class Annotate():
         self.model = None
         self.draw_prediction = False
         self.draw_label = False
+        self.saturate = False
 
         self.polygons =  [[] for i in range(len(filenames))]
         self.cur_polygons = []
@@ -45,12 +52,15 @@ class Annotate():
     def open_window(self):
 
         plt.rcParams['keymap.fullscreen'] = []
+        plt.rcParams['keymap.save'] = []
+
         fig, ax = plt.subplots(figsize=(18,15))
         self.fig = fig
         self.ax = ax
         self.fig.canvas.mpl_connect('button_press_event', self.onClick)
         self.fig.canvas.mpl_connect('key_press_event', self.onKey)
         self.fig.canvas.mpl_connect('scroll_event', self.onScroll)
+        
         self.draw_image()
 
     def read_image(self,filename):
@@ -81,6 +91,8 @@ class Annotate():
 
     def load_data(self):
 
+        self.im_idx = self.im_idx % len(self.filenames)
+        
         filename = self.filenames[self.im_idx]
 
         im = self.read_image(filename)
@@ -103,47 +115,59 @@ class Annotate():
         im = self.load_data()
 
         self.ax.clear()
-        
-        if self.model is not None:
-            if self.draw_prediction:
-                
-                im_in = np.mean(im,axis=2) 
-                pred = self.model.segment(im_in)
 
-                im = np.mean(im,axis=2)           
-                im = im[...,None]*[1,1,1]       
+        if self.saturate:
+            im = im - im.min()
+            im = im / im.max() *255
+            im = im.astype(np.uint8)
 
-                pred = pred.transpose([1,2,0])
-                #pred = pred > 0.8
-                im = channels2rgb(pred)
+        if im.shape[-1]==1:          im = im*[1,1,1]
+
+        if self.draw_prediction and self.model is not None:
+            
+            im_in = np.mean(im,axis=2) 
+            pred = self.model.segment(im_in)
+
+            im = np.mean(im,axis=2)           
+            im = im[...,None]*[1,1,1]       
+
+            pred = pred.transpose([1,2,0])
+            #pred = pred > 0.8
+            rgb = channels2rgb(pred)
+
+            im = overlay_mask(im, rgb, alpha = 0.5)
 
 
-        if self.draw_label:
+        elif self.draw_label:
 
             labeled = self.load_labeled()
 
             if labeled is not None:
-                im = channels2rgb(labeled)
-                #
-        if im.shape[-1]==1:          im = im*[1,1,1]
+                rgb = channels2rgb(labeled)
+                im = overlay_mask(im, rgb, alpha = 0.5)
+
+
+
         im = im.astype(np.uint8)
         self.ax.imshow(im)      
 
         instr = [["Left: Last Image","Right: Next Image" ],
-                        ["Up: Iterate Index up","Down: Iterate Index Down"],
-                        ["Backspace: Remove Point","Enter/Right Click: Next Object"],
-                        ["Escape: Close Tool","[i] : More information"]]
+                ["Up: Iterate Index up","Down: Iterate Index Down"],
+                ["Backspace: Remove Point","Enter/Right Click: Next Object"],
+                ["Escape: Close Tool","[i] : More information"]]
 
         # Add a table at the bottom of the axes
         table = plt.table(cellText= instr, loc='top')
-        table.set_fontsize(30)
+        table.set_fontsize(20)
+        #table.set_color('k')
         table.scale(1,3)
 
         fn_str = self.filenames[self.im_idx]
-        fn_str = ("..."+fn_str[-20:] if len(fn_str) > 20 else fn_str)
-
+        
+        fn_str = ("..."+fn_str[-20:] if (len(fn_str) > 20) else fn_str)
+        print(fn_str, self.im_idx)
         #self.ax.set_title( instructions , fontsize = 20  )
-        self.ax.set_xlabel(fn_str + "\n Label " + str(self.cur_idx),  fontsize = 40 )
+        self.ax.set_xlabel(fn_str + "\n Label " + str(self.cur_idx),  fontsize = 20, color="k")
         self.draw_polygons()
     ##  UI   
     def onKey(self, event):
@@ -195,6 +219,10 @@ class Annotate():
 
         if event.key == "m":
             self.draw_prediction = not self.draw_prediction
+            self.draw_image( )
+
+        if event.key == "s":
+            self.saturate = not self.saturate
             self.draw_image( )
 
         if event.key == "c":
@@ -305,6 +333,18 @@ class Annotate():
 ###########################################
 import h5py
 
+def check_dataset(fns,dataset):
+
+    outlist = []
+    for fn in fns:
+
+        with h5py.File(fn, 'r') as fh: 
+            
+            if dataset in fh.keys():  continue
+            if dataset not in fh.keys(): outlist.append(fn)
+       
+    return outlist
+
 def save_labeled(fn, label_im):
 
     if ".jpg" in fn.lower() or ".tif" in fn.lower():
@@ -317,7 +357,9 @@ def save_labeled(fn, label_im):
 
 def read_H5(fn, dataset="mask_data"):
     with h5py.File(fn, 'r') as fh:   
-        if dataset not in fh.keys():  return None
+        if dataset not in fh.keys():  
+            print(fh.keys())
+            return None
         data = np.array(  fh[dataset][:]  )     
     
     if data.dtype==np.uint8:         pass
@@ -349,6 +391,15 @@ def channels2rgb(pd):
     pd = (pd*255).astype(np.uint8)
     
     return pd
+
+
+def overlay_mask(im, maskrgb, alpha = 0.8):
+    
+    b_dr = (maskrgb>0).any(axis=2)
+    x = im[b_dr]*(1-alpha) + maskrgb[b_dr]*alpha
+    im[b_dr] = x.astype(np.uint8)
+
+    return im
    
 def add_dataset(fn, data, dataset="labels"):
     with h5py.File(fn, 'r+') as fh:
@@ -366,11 +417,6 @@ def resize_label(fn):
     msk = read_H5(fn, dataset="mask_data")  
     lbl = cv2.resize(lbl,msk.shape[::-1])
     add_dataset(fn, lbl, dataset="labels")  
-
-
-
-
-
 
 ###########################################
 ##          Video Frame Selecting 
